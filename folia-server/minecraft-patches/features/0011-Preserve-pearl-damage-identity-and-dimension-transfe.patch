@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 527953120 <3091193455@qq.com>
+Date: Fri, 13 Nov 2026 07:38:37 +0800
+Subject: [PATCH] Preserve pearl damage identity and dimension-transfer
+ survival
+
+Fix Folia #438 by retaining the pearl as the damage-event source without reading its state from the delayed callback. Fix #421 by distinguishing temporary CHANGED_DIMENSION removal from death when applying enderPearlsVanishOnDeath.
+
+diff --git a/net/minecraft/world/entity/projectile/throwableitemprojectile/ThrownEnderpearl.java b/net/minecraft/world/entity/projectile/throwableitemprojectile/ThrownEnderpearl.java
+index 7d8c528a76e6a95d27368bc459d654c6ef66dd8f..7b5b3b31d94744151e2a0c5c312dfebf3bb8b2c8 100644
+--- a/net/minecraft/world/entity/projectile/throwableitemprojectile/ThrownEnderpearl.java
++++ b/net/minecraft/world/entity/projectile/throwableitemprojectile/ThrownEnderpearl.java
+@@ -76,7 +76,7 @@ public class ThrownEnderpearl extends ThrowableItemProjectile {
+     }
+ 
+     // Folia start - region threading
+-    private static void attemptTeleport(Entity source, ServerLevel checkWorld, net.minecraft.world.phys.Vec3 to) {
++    private static void attemptTeleport(Entity source, ThrownEnderpearl pearl, ServerLevel checkWorld, net.minecraft.world.phys.Vec3 to) {
+         final boolean onPortalCooldown = source.isOnPortalCooldown();
+         // ignore retired callback, in those cases we do not want to teleport
+         source.getBukkitEntity().taskScheduler.schedule(
+@@ -135,7 +135,7 @@ public class ThrownEnderpearl extends ThrowableItemProjectile {
+                             // damage player
+                             teleported.resetFallDistance();
+                             player.resetCurrentImpulseContext();
+-                            player.hurtServer(player.level(), player.damageSources().enderPearl().eventEntityDamager(player), 5.0F); // CraftBukkit // Paper - fix DamageSource API
++                            player.hurtServer(player.level(), player.damageSources().enderPearl().eventEntityDamager(pearl), 5.0F); // CraftBukkit // Paper - fix DamageSource API
+                             playSound(teleported.level(), to);
+                         } else {
+                             // reset fall damage so that if the entity was falling they do not instantly die
+@@ -176,7 +176,7 @@ public class ThrownEnderpearl extends ThrowableItemProjectile {
+                 }
+                 Entity entity = this.getOwnerRaw();
+                 if (entity != null) {
+-                    attemptTeleport(entity, (ServerLevel)this.level(), this.position());
++                    attemptTeleport(entity, this, (ServerLevel)this.level(), this.position());
+                 }
+                 this.discard(org.bukkit.event.entity.EntityRemoveEvent.Cause.HIT);
+                 return;
+@@ -258,6 +258,7 @@ public class ThrownEnderpearl extends ThrowableItemProjectile {
+             Entity entity = this.owner != null ? findOwnerIncludingDeadPlayer(serverLevel, this.owner.getUUID()) : null;
+             if (entity instanceof ServerPlayer serverPlayer
+                 && !entity.isAlive()
++                && serverPlayer.getRemovalReason() != Entity.RemovalReason.CHANGED_DIMENSION
+                 && !serverPlayer.wonGame
+                 && serverPlayer.level().getGameRules().get(GameRules.ENDER_PEARLS_VANISH_ON_DEATH)) {
+                 this.discard(org.bukkit.event.entity.EntityRemoveEvent.Cause.DESPAWN); // CraftBukkit - add Bukkit remove cause
