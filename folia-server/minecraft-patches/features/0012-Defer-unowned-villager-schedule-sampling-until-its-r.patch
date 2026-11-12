@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 527953120 <3091193455@qq.com>
+Date: Fri, 13 Nov 2026 07:38:37 +0800
+Subject: [PATCH] Defer unowned villager schedule sampling until its region
+ tick
+
+Address Folia #431 without postponing brain activity registration. Constructing dimension-transfer copies must not sample the destination environment from the source region. Keep normal valid owner-thread refreshes immediate; pending initialization runs before the first active or inactive AI step. Do not initialize the pending field after superclass makeBrain.
+
+diff --git a/net/minecraft/world/entity/npc/villager/Villager.java b/net/minecraft/world/entity/npc/villager/Villager.java
+index 8616a8f5b720eac2bb5b3d78a3b69d40bb0b5547..c8603825274b1d4f75b7238358feda01767990a7 100644
+--- a/net/minecraft/world/entity/npc/villager/Villager.java
++++ b/net/minecraft/world/entity/npc/villager/Villager.java
+@@ -126,6 +126,8 @@ public class Villager extends AbstractVillager implements ReputationEventHandler
+     public int numberOfRestocksToday = 0;
+     private long lastRestockCheckDay;
+     private boolean assignProfessionWhenSpawned = false;
++    // Folia - makeBrain is called during superclass construction; do not initialize this field here.
++    private boolean pendingBrainActivityUpdate;
+     private static final ImmutableList<MemoryModuleType<?>> MEMORY_TYPES = ImmutableList.of(
+         MemoryModuleType.HOME,
+         MemoryModuleType.JOB_SITE,
+@@ -250,7 +252,14 @@ public class Villager extends AbstractVillager implements ReputationEventHandler
+         villagerBrain.setCoreActivities(ImmutableSet.of(Activity.CORE));
+         villagerBrain.setDefaultActivity(Activity.IDLE);
+         villagerBrain.setActiveActivityIfPossible(Activity.IDLE);
+-        villagerBrain.updateActivityFromSchedule(this.level().environmentAttributes(), this.level().getLevelData().getGameTime(), this.position()); // Folia - region threading - not in the world yet
++        // Folia start - dimension-transfer copies are constructed on the source region thread
++        if (this.valid && ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this)) {
++            villagerBrain.updateActivityFromSchedule(this.level().environmentAttributes(), this.level().getLevelData().getGameTime(), this.position());
++            this.pendingBrainActivityUpdate = false;
++        } else {
++            this.pendingBrainActivityUpdate = true;
++        }
++        // Folia end - dimension-transfer copies are constructed on the source region thread
+     }
+ 
+     @Override
+@@ -295,6 +304,12 @@ public class Villager extends AbstractVillager implements ReputationEventHandler
+     }
+     protected void customServerAiStep(ServerLevel level, final boolean inactive) {
+         // Paper end - EAR 2
++        // Folia start - sample destination environment only from the owning region tick
++        if (this.pendingBrainActivityUpdate) {
++            this.getBrain().updateActivityFromSchedule(level.environmentAttributes(), level.getLevelData().getGameTime(), this.position());
++            this.pendingBrainActivityUpdate = false;
++        }
++        // Folia end - sample destination environment only from the owning region tick
+         ProfilerFiller profilerFiller = Profiler.get();
+         profilerFiller.push("villagerBrain");
+         if (!inactive) this.getBrain().tick(level, this); // Paper - EAR 2
