@@ -1,0 +1,353 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 527953120 <3091193455@qq.com>
+Date: Fri, 13 Nov 2026 07:36:35 +0800
+Subject: [PATCH] Synchronize player visibility state across region removal
+
+Fix the shared map, nested plugin sets, and first/last inversion transitions from Folia issue #406. All state access uses a per-player lock; tracking, packets, and plugin events stay outside it. Synchronize the shared weak-reference cache separately without nested locks. Add 5 regression tests including concurrent registration, removal, and visibility reads. This does not make arbitrary off-thread tracker calls supported.
+
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+index 403859ddf90036dc812eab707cd06499c6dbf8f7..71ac6dc3b99832d004edcc61d7027e0685e7aefa 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftPlayer.java
+@@ -234,7 +234,11 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+     private long lastPlayed = 0;
+     private boolean hasPlayedBefore = false;
+     private final ConversationTracker conversationTracker = new ConversationTracker();
++    // Folia start - protect visibility state shared with entity removal on other regions
++    private final Object invertedVisibilityLock = new Object();
++    // Both this map and its plugin sets are guarded by invertedVisibilityLock.
+     private final Map<UUID, Set<WeakReference<Plugin>>> invertedVisibilityEntities = new HashMap<>();
++    // Folia end - protect visibility state shared with entity removal on other regions
+     private final Set<UUID> unlistedEntities = new HashSet<>(); // Paper - Add Listing API for Player
+     private static final WeakHashMap<Plugin, WeakReference<Plugin>> pluginWeakReferences = new WeakHashMap<>();
+     private int hash = 0;
+@@ -1851,7 +1855,12 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+     }
+ 
+     private static @Nullable WeakReference<Plugin> getPluginWeakReference(@Nullable Plugin plugin) {
+-        return (plugin == null) ? null : CraftPlayer.pluginWeakReferences.computeIfAbsent(plugin, WeakReference::new);
++        // Folia start - the reference cache is shared by players on different regions
++        if (plugin == null) return null;
++        synchronized (CraftPlayer.pluginWeakReferences) {
++            return CraftPlayer.pluginWeakReferences.computeIfAbsent(plugin, WeakReference::new);
++        }
++        // Folia end - the reference cache is shared by players on different regions
+     }
+ 
+     @Override
+@@ -1886,18 +1895,24 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+     }
+ 
+     private boolean addInvertedVisibility(@Nullable Plugin plugin, org.bukkit.entity.Entity entity) {
+-        Set<WeakReference<Plugin>> invertedPlugins = this.invertedVisibilityEntities.get(entity.getUniqueId());
+-        if (invertedPlugins != null) {
+-            // Some plugins are already inverting the entity. Just mark that this
+-            // plugin wants the entity inverted too and end.
+-            invertedPlugins.add(CraftPlayer.getPluginWeakReference(plugin));
+-            return false;
+-        }
+-        invertedPlugins = new HashSet<>();
+-        invertedPlugins.add(CraftPlayer.getPluginWeakReference(plugin));
+-        this.invertedVisibilityEntities.put(entity.getUniqueId(), invertedPlugins);
++        // Folia start - atomically update the map and its plugin set
++        final UUID entityId = entity.getUniqueId();
++        final WeakReference<Plugin> pluginReference = CraftPlayer.getPluginWeakReference(plugin);
++        synchronized (this.invertedVisibilityLock) {
++            Set<WeakReference<Plugin>> invertedPlugins = this.invertedVisibilityEntities.get(entityId);
++            if (invertedPlugins != null) {
++                // Some plugins are already inverting the entity. Just mark that this
++                // plugin wants the entity inverted too and end.
++                invertedPlugins.add(pluginReference);
++                return false;
++            }
++            invertedPlugins = new HashSet<>();
++            invertedPlugins.add(pluginReference);
++            this.invertedVisibilityEntities.put(entityId, invertedPlugins);
+ 
+-        return true;
++            return true;
++        }
++        // Folia end - atomically update the map and its plugin set
+     }
+ 
+     private void untrackAndHideEntity(org.bukkit.entity.Entity entity) {
+@@ -1931,7 +1946,7 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+             return;
+         }
+ 
+-        if (this.invertedVisibilityEntities.remove(entity.getUniqueId()) == null) {
++        if (this.clearInvertedVisibility(entity.getUniqueId())) { // Folia - synchronize visibility state only, not tracking or events
+             this.untrackAndHideEntity(entity);
+         }
+     }
+@@ -1968,18 +1983,39 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+     }
+ 
+     private boolean removeInvertedVisibility(@Nullable Plugin plugin, org.bukkit.entity.Entity entity) {
+-        Set<WeakReference<Plugin>> invertedPlugins = this.invertedVisibilityEntities.get(entity.getUniqueId());
+-        if (invertedPlugins == null) {
+-            return false; // Entity isn't inverted
++        // Folia start - atomically update the map and its plugin set
++        final UUID entityId = entity.getUniqueId();
++        final WeakReference<Plugin> pluginReference = CraftPlayer.getPluginWeakReference(plugin);
++        synchronized (this.invertedVisibilityLock) {
++            Set<WeakReference<Plugin>> invertedPlugins = this.invertedVisibilityEntities.get(entityId);
++            if (invertedPlugins == null) {
++                return false; // Entity isn't inverted
++            }
++            invertedPlugins.remove(pluginReference);
++            if (!invertedPlugins.isEmpty()) {
++                return false; // Some other plugins still want the entity inverted
++            }
++            this.invertedVisibilityEntities.remove(entityId);
++
++            return true;
+         }
+-        invertedPlugins.remove(CraftPlayer.getPluginWeakReference(plugin));
+-        if (!invertedPlugins.isEmpty()) {
+-            return false; // Some other plugins still want the entity inverted
++        // Folia end - atomically update the map and its plugin set
++    }
++
++    // Folia start - shared visibility state access, with tracking and events outside the lock
++    // Return true when no inversion existed, matching the reset methods' tracking decision.
++    private boolean clearInvertedVisibility(UUID entityId) {
++        synchronized (this.invertedVisibilityLock) {
++            return this.invertedVisibilityEntities.remove(entityId) == null;
+         }
+-        this.invertedVisibilityEntities.remove(entity.getUniqueId());
++    }
+ 
+-        return true;
++    private boolean hasInvertedVisibility(UUID entityId) {
++        synchronized (this.invertedVisibilityLock) {
++            return this.invertedVisibilityEntities.containsKey(entityId);
++        }
+     }
++    // Folia end - shared visibility state access, with tracking and events outside the lock
+ 
+     private void trackAndShowEntity(org.bukkit.entity.Entity entity) {
+         this.trackAndShowEntity(entity, null);
+@@ -2047,7 +2083,7 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+             return;
+         }
+ 
+-        if (this.invertedVisibilityEntities.remove(entity.getUniqueId()) == null) {
++        if (this.clearInvertedVisibility(entity.getUniqueId())) { // Folia - synchronize visibility state only, not tracking or events
+             this.trackAndShowEntity(entity);
+         }
+     }
+@@ -2080,7 +2116,7 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+     // Paper end
+ 
+     public void onEntityRemove(Entity entity) {
+-        this.invertedVisibilityEntities.remove(entity.getUUID());
++        this.clearInvertedVisibility(entity.getUUID()); // Folia - removal may run on another region
+     }
+ 
+     @Override
+@@ -2090,7 +2126,7 @@ public class CraftPlayer extends CraftHumanEntity implements Player, PluginMessa
+ 
+     @Override
+     public boolean canSee(org.bukkit.entity.Entity entity) {
+-        return this.equals(entity) || entity.isVisibleByDefault() ^ this.invertedVisibilityEntities.containsKey(entity.getUniqueId()); // SPIGOT-7312: Can always see self
++        return this.equals(entity) || entity.isVisibleByDefault() ^ this.hasInvertedVisibility(entity.getUniqueId()); // SPIGOT-7312: Can always see self // Folia - synchronize visibility reads
+     }
+ 
+     public boolean canSeePlayer(UUID uuid) {
+diff --git a/src/test/java/org/bukkit/craftbukkit/entity/CraftPlayerVisibilityTest.java b/src/test/java/org/bukkit/craftbukkit/entity/CraftPlayerVisibilityTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c799e0929d7619922fd002268f7fe2e412a0e117
+--- /dev/null
++++ b/src/test/java/org/bukkit/craftbukkit/entity/CraftPlayerVisibilityTest.java
+@@ -0,0 +1,190 @@
++package org.bukkit.craftbukkit.entity;
++
++import static org.junit.jupiter.api.Assertions.*;
++import static org.mockito.Mockito.*;
++
++import java.lang.reflect.Method;
++import java.util.UUID;
++import java.util.concurrent.Callable;
++import java.util.concurrent.CyclicBarrier;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import net.minecraft.server.dedicated.DedicatedPlayerList;
++import net.minecraft.server.level.ServerPlayer;
++import net.minecraft.world.entity.EntityType;
++import org.bukkit.GameMode;
++import org.bukkit.craftbukkit.CraftServer;
++import org.bukkit.entity.Entity;
++import org.bukkit.plugin.Plugin;
++import org.bukkit.support.environment.VanillaFeature;
++import org.junit.jupiter.api.Test;
++
++@VanillaFeature
++public class CraftPlayerVisibilityTest {
++    private static final int CONCURRENT_ROUNDS = 250;
++
++    // Exercise the state transitions without running trackers or plugin events off-thread.
++    private static boolean change(CraftPlayer player, String methodName, Plugin plugin, Entity entity) throws Exception {
++        Method method = CraftPlayer.class.getDeclaredMethod(methodName, Plugin.class, Entity.class);
++        method.setAccessible(true);
++        return (boolean) method.invoke(player, plugin, entity);
++    }
++
++    private static CraftPlayer createPlayer() {
++        CraftServer server = mock(CraftServer.class);
++        when(server.getDefaultGameMode()).thenReturn(GameMode.SURVIVAL);
++        when(server.getHandle()).thenReturn(mock(DedicatedPlayerList.class));
++        ServerPlayer handle = mock(ServerPlayer.class);
++        doReturn(EntityType.PLAYER).when(handle).getType();
++        when(handle.getUUID()).thenReturn(UUID.randomUUID());
++        return new CraftPlayer(server, handle);
++    }
++
++    private static Entity createEntity(boolean visibleByDefault) {
++        Entity entity = mock(Entity.class);
++        when(entity.getUniqueId()).thenReturn(UUID.randomUUID());
++        when(entity.isVisibleByDefault()).thenReturn(visibleByDefault);
++        return entity;
++    }
++
++    @Test
++    public void visibilityChangesOnlyOnFirstRegistrationAndLastRemoval() throws Exception {
++        CraftPlayer player = createPlayer();
++        Entity entity = createEntity(true);
++        Plugin first = mock(Plugin.class);
++        Plugin second = mock(Plugin.class);
++        Plugin unrelated = mock(Plugin.class);
++
++        assertTrue(player.canSee(entity));
++        assertTrue(change(player, "addInvertedVisibility", first, entity));
++        assertFalse(change(player, "addInvertedVisibility", first, entity));
++        assertFalse(change(player, "addInvertedVisibility", second, entity));
++        assertFalse(player.canSee(entity));
++        assertFalse(change(player, "removeInvertedVisibility", unrelated, entity));
++        assertFalse(change(player, "removeInvertedVisibility", first, entity));
++        assertFalse(change(player, "removeInvertedVisibility", first, entity));
++        assertFalse(player.canSee(entity));
++        assertTrue(change(player, "removeInvertedVisibility", second, entity));
++        assertFalse(change(player, "removeInvertedVisibility", second, entity));
++        assertTrue(player.canSee(entity));
++    }
++
++    @Test
++    public void legacyNullPluginAndInvisibleByDefaultKeepTheirSemantics() throws Exception {
++        CraftPlayer player = createPlayer();
++        Entity entity = createEntity(false);
++        assertFalse(player.canSee(entity));
++        assertTrue(change(player, "addInvertedVisibility", null, entity));
++        assertFalse(change(player, "addInvertedVisibility", null, entity));
++        assertTrue(player.canSee(entity));
++        assertTrue(change(player, "removeInvertedVisibility", null, entity));
++        assertFalse(player.canSee(entity));
++    }
++
++    @Test
++    public void concurrentRegistrationKeepsBothPluginsAndOneTransition() throws Exception {
++        CraftPlayer player = createPlayer();
++        Entity entity = createEntity(true);
++        Plugin first = mock(Plugin.class);
++        Plugin second = mock(Plugin.class);
++        runConcurrently(
++            () -> change(player, "addInvertedVisibility", first, entity),
++            () -> change(player, "addInvertedVisibility", second, entity),
++            () -> assertTrue(player.canSee(entity)),
++            (firstChanged, secondChanged) -> {
++                assertNotEquals(firstChanged, secondChanged, "Only the first plugin changes visibility");
++                assertFalse(change(player, "removeInvertedVisibility", first, entity));
++                assertTrue(change(player, "removeInvertedVisibility", second, entity));
++                assertTrue(player.canSee(entity));
++            }
++        );
++    }
++
++    @Test
++    public void concurrentRemovalReportsOnlyTheLastTransition() throws Exception {
++        CraftPlayer player = createPlayer();
++        Entity entity = createEntity(true);
++        Plugin first = mock(Plugin.class);
++        Plugin second = mock(Plugin.class);
++        runConcurrently(
++            () -> change(player, "removeInvertedVisibility", first, entity),
++            () -> change(player, "removeInvertedVisibility", second, entity),
++            () -> {
++                assertTrue(change(player, "addInvertedVisibility", first, entity));
++                assertFalse(change(player, "addInvertedVisibility", second, entity));
++            },
++            (firstChanged, secondChanged) -> {
++                assertNotEquals(firstChanged, secondChanged, "Only the last plugin changes visibility");
++                assertTrue(player.canSee(entity));
++            }
++        );
++    }
++
++    @Test
++    public void entityRemovalCanRaceWithVisibilityRegistration() throws Exception {
++        CraftPlayer player = createPlayer();
++        Entity entity = createEntity(true);
++        net.minecraft.world.entity.Entity removed = mock(net.minecraft.world.entity.Entity.class);
++        final UUID entityId = entity.getUniqueId();
++        when(removed.getUUID()).thenReturn(entityId);
++        Plugin plugin = mock(Plugin.class);
++        runConcurrently(
++            () -> change(player, "addInvertedVisibility", plugin, entity),
++            () -> {
++                player.onEntityRemove(removed);
++                return player.canSee(entity);
++            },
++            () -> assertTrue(player.canSee(entity)),
++            (registered, visibleDuringRemoval) -> {
++                assertTrue(registered);
++                player.onEntityRemove(removed);
++                assertTrue(player.canSee(entity));
++            }
++        );
++    }
++
++    private static void runConcurrently(Callable<Boolean> first, Callable<Boolean> second, CheckedAction before, CheckedResults after) throws Exception {
++        CyclicBarrier barrier = new CyclicBarrier(3);
++        boolean[] firstResults = new boolean[CONCURRENT_ROUNDS];
++        boolean[] secondResults = new boolean[CONCURRENT_ROUNDS];
++        ExecutorService executor = Executors.newFixedThreadPool(2);
++        try {
++            Future<?> firstTask = submit(executor, barrier, first, firstResults);
++            Future<?> secondTask = submit(executor, barrier, second, secondResults);
++            for (int round = 0; round < CONCURRENT_ROUNDS; ++round) {
++                before.run();
++                barrier.await(5, TimeUnit.SECONDS);
++                barrier.await(5, TimeUnit.SECONDS);
++                after.accept(firstResults[round], secondResults[round]);
++            }
++            firstTask.get(5, TimeUnit.SECONDS);
++            secondTask.get(5, TimeUnit.SECONDS);
++        } finally {
++            executor.shutdownNow();
++            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS), "Visibility workers must stop");
++        }
++    }
++
++    private static Future<?> submit(ExecutorService executor, CyclicBarrier barrier, Callable<Boolean> operation, boolean[] results) {
++        return executor.submit(() -> {
++            for (int round = 0; round < CONCURRENT_ROUNDS; ++round) {
++                barrier.await(5, TimeUnit.SECONDS);
++                results[round] = operation.call();
++                barrier.await(5, TimeUnit.SECONDS);
++            }
++            return null;
++        });
++    }
++
++    @FunctionalInterface
++    private interface CheckedAction {
++        void run() throws Exception;
++    }
++
++    @FunctionalInterface
++    private interface CheckedResults {
++        void accept(boolean first, boolean second) throws Exception;
++    }
++}
