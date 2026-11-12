@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 527953120 <3091193455@qq.com>
+Date: Fri, 13 Nov 2026 07:35:28 +0800
+Subject: [PATCH] Test disabled debug subscription service under concurrent
+ calls
+
+Verify requested debug data stays disabled and concurrent tick, broadcast, and permission queries do not touch mutable server, player, or packet state.
+
+diff --git a/src/test/java/net/minecraft/util/debug/ServerDebugSubscribersTest.java b/src/test/java/net/minecraft/util/debug/ServerDebugSubscribersTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc3b46a32ad59426ff0c10e6d292a3076944e07f
+--- /dev/null
++++ b/src/test/java/net/minecraft/util/debug/ServerDebugSubscribersTest.java
+@@ -0,0 +1,62 @@
++package net.minecraft.util.debug;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Set;
++import java.util.concurrent.Callable;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++import net.minecraft.network.protocol.Packet;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerPlayer;
++import org.bukkit.support.environment.Normal;
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.Mockito.CALLS_REAL_METHODS;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verifyNoInteractions;
++
++@Normal
++class ServerDebugSubscribersTest {
++    @Test
++    void requestedSubscriptionsNeverBecomeEffective() {
++        final ServerPlayer player = mock(ServerPlayer.class, CALLS_REAL_METHODS);
++        final DebugSubscription<?> subscription = mock(DebugSubscription.class);
++
++        player.requestDebugSubscriptions(Set.of(subscription));
++
++        assertTrue(player.debugSubscriptions().isEmpty());
++    }
++
++    @Test
++    void concurrentTicksStayDisabledWithoutReadingServerOrPlayerState() throws Exception {
++        final MinecraftServer server = mock(MinecraftServer.class);
++        final ServerPlayer player = mock(ServerPlayer.class);
++        final DebugSubscription<?> subscription = mock(DebugSubscription.class);
++        final Packet<?> packet = mock(Packet.class);
++        final ServerDebugSubscribers subscribers = new ServerDebugSubscribers(server);
++        final List<Callable<Void>> tasks = new ArrayList<>();
++
++        for (int worker = 0; worker < 8; ++worker) {
++            tasks.add(() -> {
++                for (int tick = 0; tick < 1000; ++tick) {
++                    subscribers.tick();
++                    subscribers.broadcastToAll(subscription, packet);
++                    assertTrue(subscribers.enabledSubscriptions().isEmpty());
++                    assertFalse(subscribers.hasAnySubscriberFor(subscription));
++                    assertFalse(subscribers.hasRequiredPermissions(player));
++                }
++                return null;
++            });
++        }
++
++        try (var executor = Executors.newFixedThreadPool(4)) {
++            for (var future : executor.invokeAll(tasks)) {
++                future.get(10, TimeUnit.SECONDS);
++            }
++        }
++        verifyNoInteractions(server, player, subscription, packet);
++    }
++}

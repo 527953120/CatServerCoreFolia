@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 527953120 <3091193455@qq.com>
+Date: Fri, 13 Nov 2026 07:35:28 +0800
+Subject: [PATCH] Disable unsafe shared server debug subscriptions
+
+Mitigate Folia issues #472 and #432 using the conservative direction of PR #499. ServerPlayer exposes no effective subscriptions and the subscriber service is stateless and inert. This deliberately disables server-provided debug feeds such as MiniHUD until their source and subscriber state is region-owned; a map snapshot alone cannot fix the shared synchronizers.
+
+diff --git a/net/minecraft/server/level/ServerPlayer.java b/net/minecraft/server/level/ServerPlayer.java
+index 01e067a0045e59094bf271c448f158f932199aa3..bcb7013c3d11ee74ff5f97b6fc0f6ce1915caf71 100644
+--- a/net/minecraft/server/level/ServerPlayer.java
++++ b/net/minecraft/server/level/ServerPlayer.java
+@@ -3460,7 +3460,8 @@ public class ServerPlayer extends Player implements ca.spottedleaf.moonrise.patc
+     }
+ 
+     public Set<DebugSubscription<?>> debugSubscriptions() {
+-        return !this.server.debugSubscribers().hasRequiredPermissions(this) ? Set.of() : this.requestedDebugSubscriptions;
++        // Folia - region threading - shared debug synchronizers are unsafe (PaperMC/Folia#499).
++        return Set.of(); // Disables server-provided debug data, including MiniHUD subscriptions.
+     }
+ 
+     public record RespawnConfig(LevelData.RespawnData respawnData, boolean forced) {
+diff --git a/net/minecraft/util/debug/ServerDebugSubscribers.java b/net/minecraft/util/debug/ServerDebugSubscribers.java
+index a700521a74b7e8b0c3000df18dce85592f01e568..49e58d113c71a6996e9ac3b9593b588d86b47d2b 100644
+--- a/net/minecraft/util/debug/ServerDebugSubscribers.java
++++ b/net/minecraft/util/debug/ServerDebugSubscribers.java
+@@ -1,56 +1,31 @@
+ package net.minecraft.util.debug;
+ 
+-import java.util.ArrayList;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+ import java.util.Set;
+-import net.minecraft.SharedConstants;
+ import net.minecraft.network.protocol.Packet;
+ import net.minecraft.server.MinecraftServer;
+ import net.minecraft.server.level.ServerPlayer;
+-import net.minecraft.server.players.NameAndId;
+ 
+ public class ServerDebugSubscribers {
+-    private final MinecraftServer server;
+-    private final Map<DebugSubscription<?>, List<ServerPlayer>> enabledSubscriptions = new HashMap<>();
+-
++    // Folia - region threading - keep this service inert until debug synchronizers are region-owned.
++    // This follows PaperMC/Folia#499 and disables server-provided debug data, including MiniHUD.
+     public ServerDebugSubscribers(MinecraftServer server) {
+-        this.server = server;
+-    }
+-
+-    private List<ServerPlayer> getSubscribersFor(DebugSubscription<?> subscription) {
+-        return this.enabledSubscriptions.getOrDefault(subscription, List.of());
+     }
+ 
+     public void tick() {
+-        this.enabledSubscriptions.values().forEach(List::clear);
+-
+-        for (ServerPlayer serverPlayer : this.server.getPlayerList().getPlayers()) {
+-            for (DebugSubscription<?> debugSubscription : serverPlayer.debugSubscriptions()) {
+-                this.enabledSubscriptions.computeIfAbsent(debugSubscription, debugSubscription1 -> new ArrayList<>()).add(serverPlayer);
+-            }
+-        }
+-
+-        this.enabledSubscriptions.values().removeIf(List::isEmpty);
+     }
+ 
+     public void broadcastToAll(DebugSubscription<?> subscription, Packet<?> packet) {
+-        for (ServerPlayer serverPlayer : this.getSubscribersFor(subscription)) {
+-            serverPlayer.connection.send(packet);
+-        }
+     }
+ 
+     public Set<DebugSubscription<?>> enabledSubscriptions() {
+-        return Set.copyOf(this.enabledSubscriptions.keySet());
++        return Set.of();
+     }
+ 
+     public boolean hasAnySubscriberFor(DebugSubscription<?> subscription) {
+-        return !this.getSubscribersFor(subscription).isEmpty();
++        return false;
+     }
+ 
+     public boolean hasRequiredPermissions(ServerPlayer player) {
+-        NameAndId nameAndId = player.nameAndId();
+-        return SharedConstants.IS_RUNNING_IN_IDE && this.server.isSingleplayerOwner(nameAndId) || this.server.getPlayerList().isOp(nameAndId);
++        return false;
+     }
+ }
