@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 527953120 <3091193455@qq.com>
+Date: Fri, 13 Nov 2026 07:38:38 +0800
+Subject: [PATCH] Honor asynchronous teleport relative velocity flags
+
+Fix Folia #441 by snapshotting API velocity flags before scheduling and using the existing owner-thread TeleportTransition overload for absolute motion calculation. Preserve absolute coordinates, passenger behavior, cause, and completion handling. Test 8 real API-to-NMS velocity cases.
+
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+index e6cd1c4a50b32b74f70a264e869b1ab4ac9b9eb0..b33923b9a6965ac7dabdf6bf010c22a54e3241b4 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+@@ -1131,13 +1131,22 @@ public abstract class CraftEntity implements org.bukkit.entity.Entity {
+         Location locationClone = location.clone(); // clone so we don't need to worry about mutations after this call.
+ 
+         // Folia start - region threading
++        final Set<net.minecraft.world.entity.Relative> parsedRelativeFlags = EnumSet.noneOf(net.minecraft.world.entity.Relative.class);
++        for (TeleportFlag flag : teleportFlags) {
++            if (flag instanceof TeleportFlag.Relative relativeFlag) {
++                parsedRelativeFlags.add(deltaRelativeToNMS(relativeFlag));
++            }
++        }
++        final Set<net.minecraft.world.entity.Relative> relativeFlags = Set.copyOf(parsedRelativeFlags);
+         java.util.concurrent.CompletableFuture<Boolean> ret = new java.util.concurrent.CompletableFuture<>();
+         java.util.function.Consumer<Entity> run = (Entity nmsEntity) -> {
+             boolean success = nmsEntity.teleportAsync(
+-                ((CraftWorld)locationClone.getWorld()).getHandle(),
+-                new net.minecraft.world.phys.Vec3(locationClone.getX(), locationClone.getY(), locationClone.getZ()),
+-                locationClone.getYaw(), locationClone.getPitch(), net.minecraft.world.phys.Vec3.ZERO,
+-                cause == null ? TeleportCause.UNKNOWN : cause,
++                new TeleportTransition(
++                    ((CraftWorld)locationClone.getWorld()).getHandle(),
++                    new net.minecraft.world.phys.Vec3(locationClone.getX(), locationClone.getY(), locationClone.getZ()),
++                    net.minecraft.world.phys.Vec3.ZERO, locationClone.getYaw(), locationClone.getPitch(),
++                    relativeFlags, TeleportTransition.DO_NOTHING, cause == null ? TeleportCause.UNKNOWN : cause
++                ),
+                 Entity.TELEPORT_FLAG_LOAD_CHUNK | Entity.TELEPORT_FLAG_TELEPORT_PASSENGERS, // preserve behavior with old API: dismount the entity so it can teleport
+                 (Entity entityTp) -> {
+                     ret.complete(Boolean.TRUE);
+diff --git a/src/test/java/org/bukkit/craftbukkit/entity/CraftEntityAsyncTeleportFlagsTest.java b/src/test/java/org/bukkit/craftbukkit/entity/CraftEntityAsyncTeleportFlagsTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..5ae8e93f8c5edd5eab64e1bd75427c594245b094
+--- /dev/null
++++ b/src/test/java/org/bukkit/craftbukkit/entity/CraftEntityAsyncTeleportFlagsTest.java
+@@ -0,0 +1,102 @@
++package org.bukkit.craftbukkit.entity;
++
++import io.papermc.paper.entity.TeleportFlag;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.atomic.AtomicReference;
++import java.util.function.Consumer;
++import java.util.stream.Stream;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.entity.Relative;
++import net.minecraft.world.level.portal.TeleportTransition;
++import net.minecraft.world.phys.Vec3;
++import org.bukkit.Bukkit;
++import org.bukkit.Location;
++import org.bukkit.craftbukkit.CraftWorld;
++import org.bukkit.event.player.PlayerTeleportEvent.TeleportCause;
++import org.bukkit.support.environment.Normal;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.Arguments;
++import org.junit.jupiter.params.provider.MethodSource;
++import org.mockito.MockedStatic;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertSame;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.nullable;
++import static org.mockito.Mockito.CALLS_REAL_METHODS;
++import static org.mockito.Mockito.doAnswer;
++import static org.mockito.Mockito.doReturn;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.mockStatic;
++import static org.mockito.Mockito.when;
++
++@Normal
++class CraftEntityAsyncTeleportFlagsTest {
++
++    private static Stream<Arguments> velocityCases() {
++        return Stream.of(
++            Arguments.of(new TeleportFlag[0], Vec3.ZERO),
++            Arguments.of(new TeleportFlag[]{TeleportFlag.Relative.VELOCITY_X}, new Vec3(1.0, 0.0, 0.0)),
++            Arguments.of(new TeleportFlag[]{TeleportFlag.Relative.VELOCITY_Y}, new Vec3(0.0, 2.0, 0.0)),
++            Arguments.of(new TeleportFlag[]{TeleportFlag.Relative.VELOCITY_Z}, new Vec3(0.0, 0.0, 3.0)),
++            Arguments.of(new TeleportFlag[]{TeleportFlag.Relative.VELOCITY_X, TeleportFlag.Relative.VELOCITY_Z}, new Vec3(1.0, 0.0, 3.0)),
++            Arguments.of(new TeleportFlag[]{TeleportFlag.Relative.VELOCITY_ROTATION}, Vec3.ZERO),
++            Arguments.of(new TeleportFlag[]{TeleportFlag.Relative.VELOCITY_X, TeleportFlag.Relative.VELOCITY_Y, TeleportFlag.Relative.VELOCITY_Z}, new Vec3(1.0, 2.0, 3.0)),
++            Arguments.of(new TeleportFlag[]{TeleportFlag.Relative.VELOCITY_X, TeleportFlag.Relative.VELOCITY_Y, TeleportFlag.Relative.VELOCITY_Z, TeleportFlag.Relative.VELOCITY_ROTATION}, new Vec3(-3.0, 2.0, 1.0))
++        );
++    }
++
++    @ParameterizedTest
++    @MethodSource("velocityCases")
++    @SuppressWarnings("unchecked")
++    void apiFlagsReachTheNmsAbsoluteTeleportCalculation(TeleportFlag[] flags, Vec3 expectedVelocity) {
++        final Entity entity = mock(Entity.class);
++        final CraftEntity craft = mock(CraftEntity.class, CALLS_REAL_METHODS);
++        craft.setHandle(entity);
++        doReturn(entity).when(craft).getHandle();
++        final ServerLevel world = mock(ServerLevel.class);
++        final CraftWorld craftWorld = mock(CraftWorld.class);
++        when(craftWorld.getHandle()).thenReturn(world);
++        when(entity.position()).thenReturn(new Vec3(128.0, 64.0, 256.0));
++        when(entity.getKnownMovement()).thenReturn(new Vec3(1.0, 2.0, 3.0));
++        final Vec3 destination = new Vec3(4096.5, 80.0, -4096.5);
++        final Location location = new Location(craftWorld, destination.x, destination.y, destination.z, 90.0F, 0.0F);
++        final AtomicReference<TeleportTransition> transition = new AtomicReference<>();
++        final AtomicReference<Vec3> resolvedVelocity = new AtomicReference<>();
++        doAnswer(invocation -> {
++            transition.set(invocation.getArgument(0));
++            return invocation.callRealMethod();
++        }).when(entity).teleportAsync(any(TeleportTransition.class), anyLong(), any());
++        doAnswer(invocation -> {
++            assertSame(world, invocation.getArgument(0));
++            assertEquals(destination, invocation.getArgument(1));
++            assertEquals(90.0F, (Float)invocation.getArgument(2));
++            assertEquals(0.0F, (Float)invocation.getArgument(3));
++            resolvedVelocity.set(invocation.getArgument(4));
++            assertEquals(TeleportCause.PLUGIN, invocation.getArgument(5));
++            assertEquals(Entity.TELEPORT_FLAG_LOAD_CHUNK | Entity.TELEPORT_FLAG_TELEPORT_PASSENGERS, (long)invocation.getArgument(6));
++            ((Consumer<Entity>)invocation.getArgument(7)).accept(entity);
++            return true;
++        }).when(entity).teleportAsync(any(ServerLevel.class), any(Vec3.class), nullable(Float.class), nullable(Float.class), any(Vec3.class), any(TeleportCause.class), anyLong(), any());
++
++        try (final MockedStatic<Bukkit> bukkit = mockStatic(Bukkit.class)) {
++            bukkit.when(() -> Bukkit.isOwnedByCurrentRegion(craft)).thenReturn(true);
++            final CompletableFuture<Boolean> result = craft.teleportAsync(location, TeleportCause.PLUGIN, flags);
++            assertTrue(result.isDone());
++            assertTrue(result.join());
++        }
++
++        assertEquals(expectedVelocity.x, resolvedVelocity.get().x, 1.0E-6);
++        assertEquals(expectedVelocity.y, resolvedVelocity.get().y, 1.0E-6);
++        assertEquals(expectedVelocity.z, resolvedVelocity.get().z, 1.0E-6);
++        assertFalse(transition.get().relatives().contains(Relative.X));
++        assertFalse(transition.get().relatives().contains(Relative.Y));
++        assertFalse(transition.get().relatives().contains(Relative.Z));
++        assertThrows(UnsupportedOperationException.class, () -> transition.get().relatives().add(Relative.X));
++    }
++}
