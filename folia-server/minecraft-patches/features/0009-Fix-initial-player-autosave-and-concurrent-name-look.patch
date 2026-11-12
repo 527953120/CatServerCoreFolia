@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 527953120 <3091193455@qq.com>
+Date: Fri, 13 Nov 2026 07:32:33 +0800
+Subject: [PATCH] Fix initial player autosave and concurrent name lookup
+
+Initialize the login save timestamp and handle LAST_SAVE_ABSENT before nanoTime subtraction. Keep forced saves, ownership checks, and per-tick limits unchanged. Use a concurrent name index for cross-region player lookup. References: Folia PRs #459 and #497.
+
+diff --git a/net/minecraft/server/players/PlayerList.java b/net/minecraft/server/players/PlayerList.java
+index 8274afe0d07c50ece420b1d3cb20165ed0162acb..5e1e24d2f0e08457123b77f2e06f926ef227ef85 100644
+--- a/net/minecraft/server/players/PlayerList.java
++++ b/net/minecraft/server/players/PlayerList.java
+@@ -133,7 +133,7 @@ public abstract class PlayerList {
+ 
+     // CraftBukkit start
+     private org.bukkit.craftbukkit.CraftServer cserver;
+-    private final Map<String,ServerPlayer> playersByName = new java.util.HashMap<>();
++    private final Map<String,ServerPlayer> playersByName = new java.util.concurrent.ConcurrentHashMap<>();
+     public @Nullable String collideRuleTeamName; // Paper - Configurable player collision
+ 
+     // Folia start - region threading
+@@ -292,6 +292,7 @@ public abstract class PlayerList {
+         this.players.add(player);
+         this.playersByName.put(player.getScoreboardName().toLowerCase(java.util.Locale.ROOT), player); // Spigot
+         this.playersByUUID.put(player.getUUID(), player);
++        player.lastSave = System.nanoTime(); // CatServer - initialize the autosave interval at login
+         // this.broadcastAll(ClientboundPlayerInfoUpdatePacket.createPlayerInitializing(List.of(player))); // CraftBukkit - replaced with loop below
+         // Paper start - Fire PlayerJoinEvent when Player is actually ready; correctly register player BEFORE PlayerJoinEvent, so the entity is valid and doesn't require tick delay hacks
+         player.suppressTrackerForLogin = true;
+@@ -1022,19 +1023,25 @@ public abstract class PlayerList {
+         this.saveAll(-1);
+     }
+ 
++    // CatServer start - keep the absent-save sentinel out of nanoTime arithmetic
++    static boolean isSaveDue(final long lastSave, final long now, final int interval) {
++        final long timeInterval = (long)interval * io.papermc.paper.threadedregions.TickRegionScheduler.TIME_BETWEEN_TICKS;
++        return interval == -1 || lastSave == ServerPlayer.LAST_SAVE_ABSENT || now - lastSave >= timeInterval;
++    }
++    // CatServer end
++
+     public void saveAll(final int interval) {
+         io.papermc.paper.util.MCUtil.ensureMain("Save Players" , () -> { // Paper - Ensure main
+         final ca.spottedleaf.leafprofiler.RegionizedProfiler.Handle profiler = io.papermc.paper.threadedregions.TickRegionScheduler.getProfiler(); // Folia - profiler
+         int numSaved = 0;
+         final long now = System.nanoTime(); // Folia - region threading
+-        long timeInterval = (long)interval * io.papermc.paper.threadedregions.TickRegionScheduler.TIME_BETWEEN_TICKS; // Folia - region threading
+         for (final ServerPlayer player : this.players) { // Folia - region threading
+             // Folia start - region threading
+             if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(player)) {
+                 continue;
+             }
+             // Folia end - region threading
+-            if (interval == -1 || now - player.lastSave >= timeInterval) { // Folia - region threading
++            if (isSaveDue(player.lastSave, now, interval)) { // Folia - region threading
+                 profiler.startTimer(ca.spottedleaf.leafprofiler.LProfilerRegistry.PLAYER_SAVE); try { // Folia - profiler
+                 this.save(player);
+                 } finally { profiler.stopTimer(ca.spottedleaf.leafprofiler.LProfilerRegistry.PLAYER_SAVE); } // Folia - profiler

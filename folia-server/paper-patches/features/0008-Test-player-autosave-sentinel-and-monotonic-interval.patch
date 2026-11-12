@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 527953120 <3091193455@qq.com>
+Date: Fri, 13 Nov 2026 07:32:34 +0800
+Subject: [PATCH] Test player autosave sentinel and monotonic intervals
+
+Exercise the production save policy for initial state, login intervals, negative nanoTime, wraparound, and explicit saves.
+
+diff --git a/src/test/java/net/minecraft/server/players/PlayerSaveIntervalTest.java b/src/test/java/net/minecraft/server/players/PlayerSaveIntervalTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4d6b60c7682c45a8fd518879280e0ca124e6ff21
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/players/PlayerSaveIntervalTest.java
+@@ -0,0 +1,46 @@
++package net.minecraft.server.players;
++
++import io.papermc.paper.threadedregions.TickRegionScheduler;
++import net.minecraft.server.level.ServerPlayer;
++import org.bukkit.support.environment.Normal;
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++@Normal
++class PlayerSaveIntervalTest {
++    private static final long TICK = TickRegionScheduler.TIME_BETWEEN_TICKS;
++
++    @Test
++    void neverSavedPlayerIsDueEvenWhenSubtractionWouldOverflow() {
++        assertTrue(PlayerList.isSaveDue(ServerPlayer.LAST_SAVE_ABSENT, 1L, 6000));
++        assertTrue(PlayerList.isSaveDue(ServerPlayer.LAST_SAVE_ABSENT, -1L, 6000));
++    }
++
++    @Test
++    void loginTimestampStartsAFullSaveInterval() {
++        final long login = 1234L;
++        assertFalse(PlayerList.isSaveDue(login, login, 6000));
++        assertFalse(PlayerList.isSaveDue(login, login + 6000L * TICK - 1L, 6000));
++        assertTrue(PlayerList.isSaveDue(login, login + 6000L * TICK, 6000));
++    }
++
++    @Test
++    void negativeNanoTimeIsStillAValidTimestamp() {
++        assertFalse(PlayerList.isSaveDue(-2L * TICK, -TICK - 1L, 1));
++        assertTrue(PlayerList.isSaveDue(-2L * TICK, -TICK, 1));
++    }
++
++    @Test
++    void elapsedIntervalWorksAcrossNanoTimeWraparound() {
++        final long lastSave = Long.MAX_VALUE - TICK / 2L;
++        assertFalse(PlayerList.isSaveDue(lastSave, lastSave + TICK - 1L, 1));
++        assertTrue(PlayerList.isSaveDue(lastSave, lastSave + TICK, 1));
++    }
++
++    @Test
++    void explicitSaveIgnoresInterval() {
++        assertTrue(PlayerList.isSaveDue(100L, 100L, -1));
++    }
++}
+diff --git a/src/test/java/org/bukkit/support/suite/FoliaMaintenanceTestSuite.java b/src/test/java/org/bukkit/support/suite/FoliaMaintenanceTestSuite.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..588df8c576fb2f6ab8d3d948100e4d5dbaba843a
+--- /dev/null
++++ b/src/test/java/org/bukkit/support/suite/FoliaMaintenanceTestSuite.java
+@@ -0,0 +1,15 @@
++package org.bukkit.support.suite;
++
++import org.junit.platform.suite.api.ConfigurationParameter;
++import org.junit.platform.suite.api.IncludeTags;
++import org.junit.platform.suite.api.SelectPackages;
++import org.junit.platform.suite.api.Suite;
++import org.junit.platform.suite.api.SuiteDisplayName;
++
++@Suite(failIfNoTests = false)
++@SuiteDisplayName("Folia maintenance regression tests")
++@IncludeTags("Normal")
++@SelectPackages("net.minecraft")
++@ConfigurationParameter(key = "TestSuite", value = "Normal")
++public class FoliaMaintenanceTestSuite {
++}
