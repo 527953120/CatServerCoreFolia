@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 527953120 <3091193455@qq.com>
+Date: Fri, 13 Nov 2026 07:38:39 +0800
+Subject: [PATCH] Test dragon part positions and async copy transform order
+
+Exercise real part coordinates, chunk coordinates, and bounding boxes at distant positive and negative positions, after repeated motion, and after the production async copy transform hook. This is not a live region-registration or stress test.
+
+diff --git a/src/test/java/net/minecraft/world/entity/FoliaEnderDragonPartPositionTest.java b/src/test/java/net/minecraft/world/entity/FoliaEnderDragonPartPositionTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b83acdb725211d16e5aeaa8cb5a945b11b4ca72d
+--- /dev/null
++++ b/src/test/java/net/minecraft/world/entity/FoliaEnderDragonPartPositionTest.java
+@@ -0,0 +1,117 @@
++package net.minecraft.world.entity;
++
++import java.util.stream.Stream;
++import net.minecraft.core.BlockPos;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
++import net.minecraft.world.entity.boss.enderdragon.EnderDragonPart;
++import net.minecraft.world.phys.Vec3;
++import org.bukkit.support.environment.Normal;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.MethodSource;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertSame;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.nullable;
++import static org.mockito.Mockito.doAnswer;
++import static org.mockito.Mockito.doCallRealMethod;
++import static org.mockito.Mockito.doReturn;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++@Normal
++class FoliaEnderDragonPartPositionTest {
++
++    private static Stream<Vec3> destinations() {
++        return Stream.of(new Vec3(4096.5, 80.0, -4096.5), new Vec3(-8192.25, -40.0, 12288.75));
++    }
++
++    @ParameterizedTest
++    @MethodSource("destinations")
++    void syncUpdatesRealPartPositionsChunksAndHitboxes(Vec3 destination) {
++        final EnderDragon dragon = mock(EnderDragon.class);
++        final EnderDragonPart[] parts = createParts(dragon);
++        setDragonPosition(dragon, destination);
++
++        dragon.syncPartPositions();
++        assertPartPositions(parts, destination);
++
++        // Moving the root again must not leave the old chunk or bounding box behind.
++        final Vec3 secondDestination = destination.add(1024.0, 32.0, -2048.0);
++        setDragonPosition(dragon, secondDestination);
++        dragon.syncPartPositions();
++        assertPartPositions(parts, secondDestination);
++    }
++
++    @Test
++    @SuppressWarnings({"rawtypes", "unchecked"})
++    void asyncDimensionCopySyncsPartsAfterApplyingTheDestinationTransform() {
++        final Entity source = mock(Entity.class);
++        final EnderDragon copy = mock(EnderDragon.class);
++        final EnderDragonPart[] parts = createParts(copy);
++        final EntityType type = mock(EntityType.class);
++        final ServerLevel destinationLevel = mock(ServerLevel.class);
++        final Vec3 destination = new Vec3(16384.5, 96.0, -16384.5);
++        final Vec3 velocity = new Vec3(1.0, 2.0, 3.0);
++        when(source.getType()).thenReturn(type);
++        when(type.create(destinationLevel, EntitySpawnReason.DIMENSION_TRAVEL)).thenReturn(copy);
++        doAnswer(invocation -> {
++            setDragonPosition(copy, invocation.getArgument(0));
++            return null;
++        }).when(copy).transform(any(Vec3.class), nullable(Float.class), nullable(Float.class), any(Vec3.class));
++        doCallRealMethod().when(source).transformForAsyncTeleport(destinationLevel, destination, 90.0F, 0.0F, velocity);
++
++        assertSame(copy, source.transformForAsyncTeleport(destinationLevel, destination, 90.0F, 0.0F, velocity));
++        assertPartPositions(parts, destination);
++    }
++
++    private static EnderDragonPart[] createParts(EnderDragon dragon) {
++        doReturn(EntityType.ENDER_DRAGON).when(dragon).getType();
++        final EnderDragonPart[] parts = {
++            new WorldlessDragonPart(dragon, "head", 1.0F, 1.0F),
++            new WorldlessDragonPart(dragon, "neck", 3.0F, 3.0F),
++            new WorldlessDragonPart(dragon, "body", 5.0F, 3.0F),
++            new WorldlessDragonPart(dragon, "tail", 2.0F, 2.0F),
++            new WorldlessDragonPart(dragon, "tail", 2.0F, 2.0F),
++            new WorldlessDragonPart(dragon, "tail", 2.0F, 2.0F),
++            new WorldlessDragonPart(dragon, "wing", 4.0F, 2.0F),
++            new WorldlessDragonPart(dragon, "wing", 4.0F, 2.0F)
++        };
++        when(dragon.getSubEntities()).thenReturn(parts);
++        doCallRealMethod().when(dragon).syncPartPositions();
++        return parts;
++    }
++
++    private static void setDragonPosition(EnderDragon dragon, Vec3 position) {
++        when(dragon.getX()).thenReturn(position.x);
++        when(dragon.getY()).thenReturn(position.y);
++        when(dragon.getZ()).thenReturn(position.z);
++    }
++
++    private static void assertPartPositions(EnderDragonPart[] parts, Vec3 position) {
++        for (final EnderDragonPart part : parts) {
++            assertEquals(position, part.position(), part.name);
++            assertEquals(BlockPos.containing(position), part.blockPosition(), part.name);
++            assertEquals(BlockPos.containing(position).getX() >> 4, part.chunkPosition().x, part.name);
++            assertEquals(BlockPos.containing(position).getZ() >> 4, part.chunkPosition().z, part.name);
++            assertEquals(part.getDimensions(Pose.STANDING).makeBoundingBox(position), part.getBoundingBox(), part.name);
++        }
++    }
++
++    // Keep real Entity position/chunk/AABB mechanics; skip the unrelated world collision query
++    // in refreshDimensions so the fixture needs no running server or loaded chunks.
++    private static final class WorldlessDragonPart extends EnderDragonPart {
++        private WorldlessDragonPart(EnderDragon dragon, String name, float width, float height) {
++            super(dragon, name, width, height);
++        }
++
++        @Override
++        @SuppressWarnings("deprecation")
++        public void refreshDimensions() {
++            this.fixupDimensions();
++            this.reapplyPosition();
++        }
++    }
++}

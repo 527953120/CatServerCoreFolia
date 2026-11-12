@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 527953120 <3091193455@qq.com>
+Date: Fri, 13 Nov 2026 07:38:38 +0800
+Subject: [PATCH] Synchronize dragon parts before registration and after
+ teleport copy
+
+Address the position initialization risk in Folia #427 following the focused direction of PR #504. Move all parts to the root position before region registration and after async dimension-copy transform. Normal dragon ticks restore articulated offsets. Region ownership and tracking still require live-server regression.
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/server/ServerEntityLookup.java b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/server/ServerEntityLookup.java
+index b31b55f00e2ce1bd6c1011fe852bd1dbb37de524..d10348d81b4aa3829359c502ace06cf70e6c94b2 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/server/ServerEntityLookup.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/server/ServerEntityLookup.java
+@@ -90,6 +90,11 @@ public final class ServerEntityLookup extends EntityLookup {
+ 
+     @Override
+     protected void addEntityCallback(final Entity entity) {
++        // Folia start - keep multipart entities in the owning region before region and tracking callbacks
++        if (entity instanceof net.minecraft.world.entity.boss.enderdragon.EnderDragon dragon) {
++            dragon.syncPartPositions();
++        }
++        // Folia end - keep multipart entities in the owning region before region and tracking callbacks
+         this.world.getCurrentWorldData().addEntity(entity); // Folia - region threading
+         if (entity instanceof ServerPlayer player) {
+             ((ChunkSystemServerLevel)this.serverWorld).moonrise$getNearbyPlayers().addPlayer(player);
+diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
+index a298b9babb6b42ff31781808821acd28918d7cb7..fdcdc7393123346bf42b50bf5254066e4a13de05 100644
+--- a/net/minecraft/world/entity/Entity.java
++++ b/net/minecraft/world/entity/Entity.java
+@@ -4345,6 +4345,11 @@ public abstract class Entity implements SyncedDataHolder, DebugValueSource, Name
+         Entity copy = this.getType().create(destination, EntitySpawnReason.DIMENSION_TRAVEL);
+         copy.restoreFrom(this);
+         copy.transform(pos, yaw, pitch, velocity);
++        // Folia start - keep multipart entities in the owning region after transform
++        if (copy instanceof net.minecraft.world.entity.boss.enderdragon.EnderDragon dragon) {
++            dragon.syncPartPositions();
++        }
++        // Folia end - keep multipart entities in the owning region after transform
+         // vanilla code used to call remove _after_ copying, and some stuff is required to be after copy - so add hook here
+         // for example, clearing of inventory after switching dimensions
+         this.postRemoveAfterChangingDimensions();
+diff --git a/net/minecraft/world/entity/boss/enderdragon/EnderDragon.java b/net/minecraft/world/entity/boss/enderdragon/EnderDragon.java
+index 1daf8f52148043339f723aaebdf6135763dd805b..528258e51098213f8963017abc108470cfccb11e 100644
+--- a/net/minecraft/world/entity/boss/enderdragon/EnderDragon.java
++++ b/net/minecraft/world/entity/boss/enderdragon/EnderDragon.java
+@@ -368,6 +368,14 @@ public class EnderDragon extends Mob implements Enemy {
+         part.setPos(this.getX() + offsetX, this.getY() + offsetY, this.getZ() + offsetZ);
+     }
+ 
++    // Folia start - keep multipart entities in the owning region before region and tracking callbacks
++    public void syncPartPositions() {
++        for (EnderDragonPart part : this.getSubEntities()) {
++            this.tickPart(part, 0.0, 0.0, 0.0);
++        }
++    }
++    // Folia end - keep multipart entities in the owning region before region and tracking callbacks
++
+     private float getHeadYOffset() {
+         if (this.phaseManager.getCurrentPhase().isSitting()) {
+             return -1.0F;
